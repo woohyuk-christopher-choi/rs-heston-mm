@@ -1,36 +1,49 @@
 #!/usr/bin/env python3
 """
-Step 3: Order Intensity Estimation
-논문 Eq. 13-14: Λ^a_i(δ) = A^a_i * exp(-η^a_i * δ)
+Step 3 (V5): Intensity Estimation with SIDE-only η (buy/sell) + Regime-specific A (Low/High)
 
-Key concept:
-- δ (delta): half-spread, the distance from mid-price to quote
-- Λ(δ): execution intensity (expected fills per unit time) at spread δ
-- Larger δ → fewer executions (exponential decay)
+Goal
+-----
+We estimate a structurally disciplined intensity model:
 
-Estimation approach:
-1. For each regime and side (buy/sell), group trades by the half-spread at execution
-2. Count number of executions per unit time at each spread level
-3. Fit exponential decay: Λ(δ) = A * exp(-η * δ)
+    Λ_i^k(δ) = A_i^k * exp(-η^k * δ)
+
+- Regime i ∈ {Low(0), High(1)}
+- Side  k ∈ {buy (ask-hit), sell (bid-hit)}
+- δ = Half-spread in dollars
+
+Key design choices
+------------------
+1) η is estimated ONLY by side (pooled across regimes), to stabilize slope identification.
+2) δ support is data-driven (quotes-based quantiles), no hard-coded ranges.
+3) A is regime-specific, computed from overall rate within each regime & mean δ of fills.
+4) We add a regime-wise bin-based shape check to verify that exp(-ηδ) is not grossly violated.
+
+Outputs
+-------
+- output/parameters/intensity_parameters_side_eta.csv
+    (η^buy, η^sell + A_i^k + diagnostics)
+- output/parameters/intensity_for_hjb_side_eta.csv
+    (minimal HJB input: A_i^k, η^k)
+- output/parameters/intensity_binned_rates_side_eta.csv
+    (bin audit: exposure/fills/rate per regime/side)
+- output/plots/intensity_side_eta_fit.png
+- output/plots/intensity_side_eta_fit_log.png
 """
 
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
-from pathlib import Path
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-# ============================================================================
-# Configuration
-# ============================================================================
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
-TRADING_HOURS = 6.5
-INTERVAL_MINUTES = 5
-INTERVALS_PER_DAY = int(TRADING_HOURS * 60 / INTERVAL_MINUTES)  # 78
 
-# Folder structure
+# ============================================================
+# Config
+# ============================================================
+
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -38,427 +51,735 @@ CSV_DIR = OUTPUT_DIR / "csv"
 PLOTS_DIR = OUTPUT_DIR / "plots"
 PARAMS_DIR = OUTPUT_DIR / "parameters"
 
-print("=" * 70)
-print("Step 3: Order Intensity Estimation (논문 Eq. 13-14)")
-print("=" * 70)
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+PARAMS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ============================================================================
-# 1. Load Data
-# ============================================================================
+# Strict quote-hit tolerance (dollars)
+PRICE_TOL = 0.0001
 
-print("\n" + "-" * 60)
-print("1. Loading Data")
-print("-" * 60)
+# Quote duration filtering
+MAX_GAP_SEC = 10.0  # remove big gaps between quote updates
 
-trades = pd.read_csv(CSV_DIR / 'trades_classified.csv', parse_dates=['DateTime'])
-quotes = pd.read_csv(CSV_DIR / 'quotes_cleaned.csv', parse_dates=['DateTime'])
-regimes = pd.read_csv(CSV_DIR / 'regime_results.csv', parse_dates=['DateTime'])
+# δ support quantiles (quotes-based)
+DELTA_Q_LOW = 0.01
+DELTA_Q_HIGH = 0.99
 
-print(f"  Trades: {len(trades):,}")
-print(f"  Quotes: {len(quotes):,}")
-print(f"  Regime observations: {len(regimes):,}")
+# Binning for η estimation (pooled)
+TARGET_BINS_ETA = 12
+MIN_EXPOSURE_SEC_ETA = 10.0
+MIN_FILLS_ETA = 5
 
-# ============================================================================
-# 2. Merge Regime Information
-# ============================================================================
+# Binning for regime-wise shape check (per regime/side)
+TARGET_BINS_SHAPE = 10
+MIN_EXPOSURE_SEC_SHAPE = 10.0
+MIN_FILLS_SHAPE = 5
 
-print("\n" + "-" * 60)
-print("2. Merging Regime Information")
-print("-" * 60)
 
-trades['DateTime_5min'] = trades['DateTime'].dt.floor('5min')
-regimes['DateTime_5min'] = regimes['DateTime'].dt.floor('5min')
+# ============================================================
+# Helpers
+# ============================================================
 
-trades = pd.merge(
-    trades,
-    regimes[['DateTime_5min', 'Regime']].drop_duplicates(),
-    on='DateTime_5min',
-    how='left'
-)
+def wls_loglinear_fit(delta: np.ndarray, rate: np.ndarray, weight: np.ndarray):
+    """
+    Weighted LS fit on log scale:
+        log(rate) = logA - eta * delta
 
-trades['Regime'] = trades['Regime'].ffill().bfill()
-trades = trades.dropna(subset=['Regime'])
-trades['Regime'] = trades['Regime'].astype(int)
+    Returns:
+        A, eta, r2_log, se_logA, se_eta, ok
+    """
+    mask = (rate > 0) & np.isfinite(rate) & np.isfinite(delta) & (delta >= 0)
+    if mask.sum() < 3:
+        return np.nan, np.nan, np.nan, np.nan, np.nan, False
 
-print(f"  Trades with regime: {len(trades):,}")
-print(f"  Low regime trades: {(trades['Regime']==0).sum():,}")
-print(f"  High regime trades: {(trades['Regime']==1).sum():,}")
+    x = delta[mask]
+    y = np.log(rate[mask])
+    w = weight[mask]
+    w = np.where(np.isfinite(w) & (w > 0), w, 1.0)
 
-# ============================================================================
-# 3. Calculate Half-Spread
-# ============================================================================
+    X = np.column_stack([np.ones_like(x), x])
 
-print("\n" + "-" * 60)
-print("3. Calculating Half-Spread at Execution")
-print("-" * 60)
+    try:
+        XtW = (X.T * w)
+        XtWX = XtW @ X
+        XtWy = XtW @ y
+        beta = np.linalg.inv(XtWX) @ XtWy
+        b0, b1 = beta
+    except np.linalg.LinAlgError:
+        return np.nan, np.nan, np.nan, np.nan, np.nan, False
 
-quotes_merge = quotes[['DateTime', 'Mid']].copy()
-trades = pd.merge_asof(
-    trades.sort_values('DateTime'),
-    quotes_merge.sort_values('DateTime'),
-    on='DateTime',
-    direction='backward',
-    suffixes=('', '_quote')
-)
+    y_hat = X @ beta
+    y_bar = np.average(y, weights=w)
+    ss_tot = np.sum(w * (y - y_bar) ** 2)
+    ss_res = np.sum(w * (y - y_hat) ** 2)
+    r2_log = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
-# δ calculation
-if 'Mid' not in trades.columns and 'Mid_quote' in trades.columns:
-    trades['Mid'] = trades['Mid_quote']
+    # covariance (classic WLS)
+    n = len(y)
+    p = 2
+    dof = max(n - p, 1)
+    sigma2 = ss_res / dof
+    try:
+        cov = sigma2 * np.linalg.inv(XtWX)
+        se_b0 = float(np.sqrt(cov[0, 0]))
+        se_b1 = float(np.sqrt(cov[1, 1]))
+    except np.linalg.LinAlgError:
+        se_b0, se_b1 = np.nan, np.nan
 
-trades['Delta'] = np.where(
-    trades['Side'] == 'buy',
-    np.abs(trades['Price'] - trades['Mid']),
-    np.abs(trades['Mid'] - trades['Price'])
-)
+    A = float(np.exp(b0))
+    eta = float(-b1)
+    return A, eta, float(r2_log), se_b0, se_b1, True
 
-# Filter: δ > 0 and remove outliers
-trades = trades[trades['Delta'] > 0].copy()
-delta_cap = trades['Delta'].quantile(0.99)
-trades = trades[trades['Delta'] <= delta_cap].copy()
 
-print(f"  Trades with valid δ: {len(trades):,}")
-print(f"  δ range: [{trades['Delta'].min():.6f}, {trades['Delta'].max():.6f}]")
-print(f"  Mean δ: {trades['Delta'].mean():.6f}")
-print(f"  Median δ: {trades['Delta'].median():.6f}")
+def make_bins_from_quotes(q_delta: pd.Series, low: float, high: float, target_bins: int):
+    """
+    Quantile-based bins from QUOTES (exposure distribution), restricted to [low, high].
+    """
+    s = q_delta[(q_delta >= low) & (q_delta <= high)].dropna()
+    if len(s) < 2000:
+        s = q_delta.dropna()
 
-# ============================================================================
-# 4. MLE Estimation (Primary Method)
-# ============================================================================
-"""
-Primary Method: MLE under exponential assumption
+    probs = np.linspace(0, 1, target_bins + 1)
+    edges = np.quantile(s.values, probs)
+    edges = np.unique(edges)
 
-If trades occur at various δ levels according to Λ(δ) = A*exp(-η*δ),
-and we observe the δ values of executed trades, then under mild assumptions,
-the MLE for η is simply:
+    if len(edges) < 4:
+        edges = np.linspace(float(np.nanmin(s.values)), float(np.nanmax(s.values)), max(4, target_bins + 1))
+        edges = np.unique(edges)
 
-    η_MLE = 1 / mean(δ)
+    edges[0] = min(edges[0], low)
+    edges[-1] = max(edges[-1], high)
+    edges = np.unique(edges)
+    return np.sort(edges)
 
-This is because the observed δ distribution is proportional to Λ(δ).
 
-The baseline intensity A is estimated from the total trade count:
-    A = (total trades) / (total time) * correction_factor
-"""
+def bin_exposure_and_fills(q: pd.DataFrame, t: pd.DataFrame, bin_edges: np.ndarray):
+    """
+    Compute per-bin exposure and fills.
+    q: HalfSpread, Duration_sec
+    t: Quote_Delta
+    """
+    n_bins = len(bin_edges) - 1
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
-print("\n" + "-" * 60)
-print("4. MLE Estimation (Primary Method)")
-print("-" * 60)
+    qbin = pd.cut(q["HalfSpread"], bins=bin_edges, labels=False, include_lowest=True)
+    tbin = pd.cut(t["Quote_Delta"], bins=bin_edges, labels=False, include_lowest=True)
 
-def estimate_mle(trades_subset, total_time_sec, regime_name, side_name):
-    """MLE estimation for intensity parameters."""
-    deltas = trades_subset['Delta'].values
-    n = len(deltas)
-    
-    if n < 100:
-        print(f"  {regime_name} {side_name}: Insufficient data ({n})")
-        return None
-    
-    # MLE for η
-    mean_delta = np.mean(deltas)
-    eta = 1.0 / mean_delta
-    eta_se = eta / np.sqrt(n)  # Standard error
-    
-    # Baseline intensity A
-    # A represents intensity when δ→0
-    # Observed rate = A * E[exp(-η*δ)] under the model
-    # For exponential δ with rate η: E[exp(-η*δ)] = η/(η+η) = 0.5
-    # So: A ≈ 2 * observed_rate
-    observed_rate = n / total_time_sec
-    A = observed_rate  # Simplified: use observed rate directly
-    
-    print(f"\n  {regime_name} {side_name}:")
-    print(f"    n = {n:,} trades")
-    print(f"    mean(δ) = {mean_delta:.6f}")
-    print(f"    η = {eta:.2f} ± {eta_se:.2f}")
-    print(f"    A = {A:.4f} fills/sec = {A*60:.2f} fills/min")
-    
+    exposure = q.groupby(qbin)["Duration_sec"].sum().reindex(range(n_bins), fill_value=0.0).values.astype(float)
+    fills = t.groupby(tbin).size().reindex(range(n_bins), fill_value=0).values.astype(int)
+
+    rate = fills / np.clip(exposure, 1e-12, None)
+    return centers, exposure, fills, rate
+
+
+def shape_check(centers, exposure, fills, rate, min_exp, min_fills):
+    """
+    Diagnostics:
+    - corr(delta, log(rate)) negative indicates decreasing log-rate with δ.
+    - monotone violations count: increases > 5% considered violations.
+    """
+    mask = (exposure >= min_exp) & (fills >= min_fills) & (rate > 0)
+    if mask.sum() < 3:
+        return {"shape_nbins": int(mask.sum()), "shape_corr": np.nan, "shape_monotone_viol": np.nan}
+
+    x = centers[mask]
+    y = np.log(rate[mask])
+    corr = float(np.corrcoef(x, y)[0, 1])
+
+    order = np.argsort(x)
+    r_sorted = rate[mask][order]
+    viol = int(np.sum((r_sorted[1:] - r_sorted[:-1]) > 0.05 * np.maximum(r_sorted[:-1], 1e-12)))
+
+    return {"shape_nbins": int(mask.sum()), "shape_corr": corr, "shape_monotone_viol": viol}
+
+
+def estimate_eta_pooled_by_side(quotes: pd.DataFrame, trades_strict: pd.DataFrame, side: str):
+    """
+    Estimate η^side by pooling ALL regimes, using quote-based bins and exposure/fills rates.
+    """
+    q = quotes.copy()
+    t = trades_strict[trades_strict["ExecSide"] == side].copy()
+
+    # data-driven δ support from quotes
+    low = float(q["HalfSpread"].quantile(DELTA_Q_LOW))
+    high = float(q["HalfSpread"].quantile(DELTA_Q_HIGH))
+    low = max(low, 1e-6)
+    high = max(high, low * 1.10)
+
+    # bins from quotes (NOT trades)
+    edges = make_bins_from_quotes(q["HalfSpread"], low, high, TARGET_BINS_ETA)
+    centers, exposure, fills, rate = bin_exposure_and_fills(q, t, edges)
+
+    valid = (exposure >= MIN_EXPOSURE_SEC_ETA) & (fills >= MIN_FILLS_ETA) & (rate > 0)
+    if valid.sum() < 5:
+        # adaptive fallback: fewer bins + slightly relaxed thresholds
+        for bins, min_exp, min_fill in [(8, 7.0, 4), (6, 5.0, 3), (5, 5.0, 3)]:
+            edges = make_bins_from_quotes(q["HalfSpread"], low, high, bins)
+            centers, exposure, fills, rate = bin_exposure_and_fills(q, t, edges)
+            valid = (exposure >= min_exp) & (fills >= min_fill) & (rate > 0)
+            if valid.sum() >= 3:
+                break
+
+    if valid.sum() < 3:
+        return {
+            "side": side,
+            "eta": np.nan,
+            "A_pooled": np.nan,
+            "r2_log": np.nan,
+            "delta_support_low": low,
+            "delta_support_high": high,
+            "n_valid_bins": int(valid.sum()),
+            "bins_used": int(len(edges) - 1),
+            "bin_centers": centers,
+            "bin_exposure": exposure,
+            "bin_fills": fills,
+            "bin_rates": rate,
+            "bin_valid": valid,
+        }
+
+    x = centers[valid]
+    y = rate[valid]
+    w = np.sqrt(np.maximum(fills[valid], 1))
+
+    A, eta, r2_log, se_logA, se_eta, ok = wls_loglinear_fit(x, y, w)
+    if (not ok) or (not np.isfinite(eta)) or (eta <= 0) or (not np.isfinite(A)) or (A <= 0):
+        A, eta, r2_log = np.nan, np.nan, np.nan
+
     return {
-        'n_trades': n,
-        'mean_delta': mean_delta,
-        'eta': eta,
-        'eta_se': eta_se,
-        'A': A,
-        'A_per_min': A * 60
+        "side": side,
+        "eta": float(eta),
+        "A_pooled": float(A),
+        "r2_log": float(r2_log),
+        "delta_support_low": low,
+        "delta_support_high": high,
+        "n_valid_bins": int(valid.sum()),
+        "bins_used": int(len(edges) - 1),
+        "bin_centers": centers,
+        "bin_exposure": exposure,
+        "bin_fills": fills,
+        "bin_rates": rate,
+        "bin_valid": valid,
     }
 
-# Calculate time spans
-total_time = (trades['DateTime'].max() - trades['DateTime'].min()).total_seconds()
-print(f"\n  Total time span: {total_time/3600:.1f} hours")
 
-results_mle = []
-for regime in [0, 1]:
-    regime_name = 'Low' if regime == 0 else 'High'
-    regime_data = trades[trades['Regime'] == regime]
-    regime_time = (regime_data['DateTime'].max() - regime_data['DateTime'].min()).total_seconds()
-    
-    if regime_time <= 0:
-        regime_time = total_time / 2
-    
-    for side in ['buy', 'sell']:
-        quote_side = 'ask' if side == 'buy' else 'bid'
-        subset = regime_data[regime_data['Side'] == side]
-        
-        result = estimate_mle(subset, regime_time, regime_name, f"{side} ({quote_side})")
-        if result:
-            results_mle.append({
-                'Regime': regime,
-                'Regime_Name': regime_name,
-                'Side': side,
-                'Quote_Side': quote_side,
-                **result
-            })
-
-# ============================================================================
-# 5. Empirical Rate Estimation (Secondary Method - Improved)
-# ============================================================================
-
-print("\n" + "-" * 60)
-print("5. Empirical Rate Estimation (Improved Binning)")
-print("-" * 60)
-
-def estimate_empirical_improved(trades_subset, regime_name, side_name):
+def estimate_A_regime_side_given_eta(quotes: pd.DataFrame, trades_strict: pd.DataFrame, regime: int, side: str, eta: float):
     """
-    Improved empirical estimation with equal-width binning.
+    Compute regime-specific A_i^side using:
+        overall_rate_i^side = fills / exposure
+        A_i^side = overall_rate_i^side * exp(eta * mean_delta_fills)
     """
-    deltas = trades_subset['Delta'].values
-    n = len(deltas)
-    
-    if n < 500:
-        print(f"  {regime_name} {side_name}: Insufficient data ({n})")
-        return None
-    
-    # Use equal-width bins (not percentile-based)
-    delta_min, delta_max = deltas.min(), deltas.max()
-    n_bins = 30
-    bin_edges = np.linspace(delta_min, delta_max, n_bins + 1)
-    
-    counts, _ = np.histogram(deltas, bins=bin_edges)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    bin_widths = bin_edges[1:] - bin_edges[:-1]
-    
-    # Density (normalized histogram)
-    density = counts / (n * bin_widths)
-    
-    # Filter bins with enough data
-    valid = counts >= 10
-    if valid.sum() < 5:
-        print(f"  {regime_name} {side_name}: Not enough valid bins")
-        return None
-    
-    x = bin_centers[valid]
-    y = density[valid]
-    
-    # Fit: f(δ) = C * exp(-η * δ)
-    # where C is a normalization constant
-    def exp_model(delta, C, eta):
-        return C * np.exp(-eta * delta)
-    
-    # Initial guess from log-linear fit
-    try:
-        log_y = np.log(y[y > 0])
-        x_valid = x[y > 0]
-        if len(log_y) >= 2:
-            slope, intercept = np.polyfit(x_valid, log_y, 1)
-            eta_init = -slope
-            C_init = np.exp(intercept)
-        else:
-            eta_init, C_init = 200, y.max()
-    except:
-        eta_init, C_init = 200, y.max()
-    
-    if eta_init <= 0:
-        eta_init = 200
-    
-    try:
-        popt, pcov = curve_fit(
-            exp_model, x, y,
-            p0=[C_init, eta_init],
-            bounds=([1e-10, 1], [1e6, 2000]),
-            maxfev=10000
-        )
-        C, eta = popt
-        
-        # R²
-        y_pred = exp_model(x, C, eta)
-        ss_res = np.sum((y - y_pred)**2)
-        ss_tot = np.sum((y - np.mean(y))**2)
-        r2 = 1 - ss_res/ss_tot if ss_tot > 0 else 0
-        
-        print(f"\n  {regime_name} {side_name}:")
-        print(f"    η = {eta:.2f}, R² = {r2:.3f}")
-        print(f"    valid bins = {valid.sum()}")
-        
-        return {
-            'eta': eta,
-            'C': C,
-            'r2': r2,
-            'x': x,
-            'y': y,
-            'y_pred': y_pred,
-            'n_bins': valid.sum()
-        }
-    except Exception as e:
-        print(f"  {regime_name} {side_name}: Fit failed - {e}")
-        return None
+    q = quotes[quotes["Regime"] == regime].copy()
+    t = trades_strict[(trades_strict["Regime"] == regime) & (trades_strict["ExecSide"] == side)].copy()
 
-results_empirical = []
-for regime in [0, 1]:
-    regime_name = 'Low' if regime == 0 else 'High'
-    regime_data = trades[trades['Regime'] == regime]
-    
-    for side in ['buy', 'sell']:
-        quote_side = 'ask' if side == 'buy' else 'bid'
-        subset = regime_data[regime_data['Side'] == side]
-        
-        result = estimate_empirical_improved(subset, regime_name, f"{side} ({quote_side})")
-        if result:
-            results_empirical.append({
-                'Regime': regime,
-                'Regime_Name': regime_name,
-                'Side': side,
-                'Quote_Side': quote_side,
-                **result
-            })
+    total_exposure = float(q["Duration_sec"].sum())
+    fills = int(len(t))
+    overall_rate = float(fills / max(total_exposure, 1e-12))
 
-# ============================================================================
-# 6. Save Results
-# ============================================================================
+    mean_delta = float(t["Quote_Delta"].mean()) if fills > 0 else float(q["HalfSpread"].median())
 
-print("\n" + "-" * 60)
-print("6. Saving Results")
-print("-" * 60)
+    A = overall_rate * float(np.exp(eta * mean_delta)) if np.isfinite(eta) else np.nan
+    return {
+        "regime": regime,
+        "regime_name": "Low" if regime == 0 else "High",
+        "side": side,
+        "A": float(A) if np.isfinite(A) else np.nan,
+        "overall_rate": overall_rate,
+        "mean_delta": mean_delta,
+        "total_exposure_sec": total_exposure,
+        "total_fills": fills,
+    }
 
-# MLE results (primary)
-if results_mle:
-    df_mle = pd.DataFrame([{
-        'Regime': r['Regime'],
-        'Regime_Name': r['Regime_Name'],
-        'Side': r['Side'],
-        'Quote_Side': r['Quote_Side'],
-        'A_per_sec': r['A'],
-        'A_per_min': r['A_per_min'],
-        'eta': r['eta'],
-        'eta_se': r['eta_se'],
-        'mean_delta': r['mean_delta'],
-        'n_trades': r['n_trades']
-    } for r in results_mle])
-    df_mle.to_csv(PARAMS_DIR / 'intensity_parameters_final.csv', index=False)
-    print(f"  Saved: {PARAMS_DIR}/intensity_parameters_final.csv")
 
-# ============================================================================
-# 7. Create Plots
-# ============================================================================
+def regime_shape_audit(quotes: pd.DataFrame, trades_strict: pd.DataFrame, regime: int, side: str, eta_side: float):
+    """
+    Regime-wise bin audit + shape check:
+    - compute binned empirical rate by regime/side
+    - compute correlation & monotonicity diagnostics
+    - compute fitted curve using A_i^k (not here) OR using implied A from overall_rate at mean_delta
+      For plotting, we'll compute fitted curve later using final A_i^k and eta_side.
+    """
+    q = quotes[quotes["Regime"] == regime].copy()
+    t = trades_strict[(trades_strict["Regime"] == regime) & (trades_strict["ExecSide"] == side)].copy()
 
-print("\n" + "-" * 60)
-print("7. Creating Plots")
-print("-" * 60)
+    low = float(q["HalfSpread"].quantile(DELTA_Q_LOW))
+    high = float(q["HalfSpread"].quantile(DELTA_Q_HIGH))
+    low = max(low, 1e-6)
+    high = max(high, low * 1.10)
 
-# Plot 1: Delta distribution with fitted exponential
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-plot_positions = {(0, 'buy'): (0,0), (0, 'sell'): (0,1),
-                  (1, 'buy'): (1,0), (1, 'sell'): (1,1)}
+    edges = make_bins_from_quotes(q["HalfSpread"], low, high, TARGET_BINS_SHAPE)
+    centers, exposure, fills, rate = bin_exposure_and_fills(q, t, edges)
 
-for regime in [0, 1]:
-    regime_name = 'Low' if regime == 0 else 'High'
-    regime_data = trades[trades['Regime'] == regime]
-    
-    for side in ['buy', 'sell']:
-        quote_side = 'ask' if side == 'buy' else 'bid'
-        subset = regime_data[regime_data['Side'] == side]
-        
-        row, col = plot_positions[(regime, side)]
-        ax = axes[row, col]
-        
-        # Histogram
-        deltas = subset['Delta'].values
-        ax.hist(deltas, bins=50, density=True, alpha=0.7, 
-                color='steelblue', edgecolor='white', label='Observed')
-        
-        # Fitted exponential from MLE
-        mle_result = next((r for r in results_mle 
-                          if r['Regime']==regime and r['Side']==side), None)
-        if mle_result:
-            x_range = np.linspace(0, deltas.max(), 100)
-            eta = mle_result['eta']
-            # Exponential PDF: f(x) = η * exp(-η*x)
-            y_fit = eta * np.exp(-eta * x_range)
-            ax.plot(x_range, y_fit, 'r-', lw=2, 
-                   label=f'Exp fit: η={eta:.1f}')
-        
-        ax.set_xlabel('Half-Spread δ ($)')
-        ax.set_ylabel('Density')
-        ax.set_title(f'{regime_name} Regime - {side.capitalize()} ({quote_side})\n'
-                    f'n={len(deltas):,}, mean(δ)={deltas.mean():.5f}')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        ax.set_xlim(left=0)
+    diag = shape_check(centers, exposure, fills, rate, MIN_EXPOSURE_SEC_SHAPE, MIN_FILLS_SHAPE)
+    return {
+        "delta_support_low": low,
+        "delta_support_high": high,
+        "bins_used": int(len(edges) - 1),
+        "bin_centers": centers,
+        "bin_exposure": exposure,
+        "bin_fills": fills,
+        "bin_rates": rate,
+        "shape_nbins": diag["shape_nbins"],
+        "shape_corr": diag["shape_corr"],
+        "shape_monotone_viol": diag["shape_monotone_viol"],
+    }
 
-plt.tight_layout()
-plt.savefig(PLOTS_DIR / 'delta_distribution_final.png', dpi=150)
-plt.close()
-print(f"  Saved: {PLOTS_DIR}/delta_distribution_final.png")
 
-# Plot 2: Empirical fit comparison
-if results_empirical:
+def plot_panels(results, pooled_eta, out_png, log_scale=False):
+    """
+    Plot per regime/side binned rates with fitted curves using final A_i^k and eta^k.
+    results: list of dict with keys:
+        regime, regime_name, side, A, eta, plus bin_centers/bin_rates and validity masks if desired.
+    """
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
-    for r in results_empirical:
-        regime, side = r['Regime'], r['Side']
-        row, col = plot_positions[(regime, side)]
-        ax = axes[row, col]
-        
-        ax.scatter(r['x'], r['y'], s=40, alpha=0.7, label='Empirical density')
-        
-        x_smooth = np.linspace(r['x'].min(), r['x'].max(), 100)
-        y_smooth = r['C'] * np.exp(-r['eta'] * x_smooth)
-        ax.plot(x_smooth, y_smooth, 'r-', lw=2, 
-               label=f"Fit: η={r['eta']:.1f}, R²={r['r2']:.3f}")
-        
-        ax.set_xlabel('Half-Spread δ ($)')
-        ax.set_ylabel('Density')
-        ax.set_title(f"{r['Regime_Name']} - {side.capitalize()} ({r['Quote_Side']})")
-        ax.legend()
+    pos = {(0, "buy"): (0, 0), (0, "sell"): (0, 1), (1, "buy"): (1, 0), (1, "sell"): (1, 1)}
+
+    for r in results:
+        ax = axes[pos[(r["regime"], r["side"])]]
+        x = r["bin_centers"]
+        y = r["bin_rates"]
+        exp = r["bin_exposure"]
+        fl = r["bin_fills"]
+
+        # validity for display
+        valid = (exp >= MIN_EXPOSURE_SEC_SHAPE) & (fl >= MIN_FILLS_SHAPE) & (y > 0)
+
+        if log_scale:
+            yy = np.where(y > 0, np.log(y), np.nan)
+            ax.scatter(x[valid] * 100, yy[valid], s=70, alpha=0.85, label="log empirical (valid)", zorder=3)
+            ax.scatter(x[~valid] * 100, yy[~valid], s=40, alpha=0.25, label="log empirical (other)", zorder=2)
+
+            if np.isfinite(r["A"]) and np.isfinite(r["eta"]) and r["A"] > 0 and r["eta"] > 0:
+                x_fit = np.linspace(np.nanmin(x), np.nanmax(x), 200)
+                y_fit = np.log(r["A"]) - r["eta"] * x_fit
+                ax.plot(x_fit * 100, y_fit, lw=2, label=f"fit: logΛ=logA-ηδ (η={r['eta']:.1f})")
+            ax.set_ylabel("log(Fill rate)")
+        else:
+            ax.scatter(x[valid] * 100, y[valid], s=70, alpha=0.85, label="empirical (valid)", zorder=3)
+            ax.scatter(x[~valid] * 100, y[~valid], s=40, alpha=0.25, label="empirical (other)", zorder=2)
+
+            if np.isfinite(r["A"]) and np.isfinite(r["eta"]) and r["A"] > 0 and r["eta"] > 0:
+                x_fit = np.linspace(np.nanmin(x), np.nanmax(x), 200)
+                y_fit = r["A"] * np.exp(-r["eta"] * x_fit)
+                ax.plot(x_fit * 100, y_fit, lw=2,
+                        label=f"fit: A exp(-ηδ)\nA={r['A']:.2f}, η={r['eta']:.1f}")
+            ax.set_ylabel("Fill rate (fills/sec)")
+
+        ax.set_xlabel("Half-spread δ (cents)")
         ax.grid(True, alpha=0.3)
-        ax.set_ylim(bottom=0)
-    
+
+        title = f"{r['regime_name']} - {r['side'].capitalize()}"
+        ds = f"δ∈[{r['delta_support_low']*100:.2f}¢,{r['delta_support_high']*100:.2f}¢]"
+        diag = f"corr={r['shape_corr']:.2f}, viol={r['shape_monotone_viol']}"
+        ax.set_title(f"{title}\n{ds}\n{diag}")
+
+        ax.legend(fontsize=9)
+
     plt.tight_layout()
-    plt.savefig(PLOTS_DIR / 'intensity_fit_final.png', dpi=150)
+    plt.savefig(out_png, dpi=150)
     plt.close()
-    print(f"  Saved: {PLOTS_DIR}/intensity_fit_final.png")
 
-# ============================================================================
-# 8. Summary
-# ============================================================================
 
-print("\n" + "=" * 70)
-print("FINAL RESULTS: Intensity Parameters")
-print("=" * 70)
+def plot_appendix_hexbin_with_bins(
+    quotes,
+    trades_strict,
+    final_results,   # V5에서 만든 final_results
+    figsize=(14, 10),
+    gridsize=35,
+    mincnt=1,
+    save_path=None
+):
+    """
+    Appendix plot:
+    - hexbin of raw trade density
+    - overlay all-bin averages (faint)
+    - overlay valid-bin averages (bold)
+    - overlay exp fit using A_i^k, eta^k (fit used only valid bins)
+    """
 
-print("""
-  Model: Λ(δ) = A * exp(-η * δ)
-  
-  - A: baseline intensity (fills per second when δ→0)
-  - η: price sensitivity (how fast intensity decays with spread)
-  
-  Interpretation:
-  - At δ = 0.01 ($0.01 spread), intensity drops to exp(-η*0.01) of baseline
-  - Higher η means traders are more price-sensitive
-""")
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    pos = {(0, "buy"): (0, 0), (0, "sell"): (0, 1),
+           (1, "buy"): (1, 0), (1, "sell"): (1, 1)}
 
-print("\n  MLE Results (Recommended):")
-print("-" * 60)
-print(f"  {'Regime':<6} {'Side':<6} {'A (fills/sec)':<14} {'A (fills/min)':<14} {'η':<10}")
-print("-" * 60)
-for r in results_mle:
-    print(f"  {r['Regime_Name']:<6} {r['Side']:<6} {r['A']:>13.4f} {r['A_per_min']:>13.2f} {r['eta']:>9.2f}")
-print("-" * 60)
+    for r in final_results:
+        ax = axes[pos[(r["regime"], r["side"])]]
 
-# Economic interpretation
-print("\n  Economic Interpretation:")
-for r in results_mle:
-    delta_1cent = 0.01
-    decay = np.exp(-r['eta'] * delta_1cent)
-    print(f"    {r['Regime_Name']} {r['Side']}: At δ=$0.01, intensity is {decay*100:.1f}% of baseline")
+        # -------------------------
+        # 1) Raw trade density
+        # -------------------------
+        t = trades_strict[
+            (trades_strict["Regime"] == r["regime"]) &
+            (trades_strict["ExecSide"] == r["side"])
+        ]
 
-print("\n" + "=" * 70)
-print("✅ Step 3 Complete!")
-print("=" * 70)
+        hb = ax.hexbin(
+            t["Quote_Delta"] * 100,      # cents
+            np.zeros(len(t)),            # dummy y (density only)
+            gridsize=gridsize,
+            cmap="Greys",
+            mincnt=mincnt,
+            bins="log",
+            alpha=0.5
+        )
+
+        # -------------------------
+        # 2) Bin averages
+        # -------------------------
+        x = r["bin_centers"] * 100
+        y = r["bin_rates"]
+        exp = r["bin_exposure"]
+        fl = r["bin_fills"]
+
+        valid = (exp >= 10) & (fl >= 5) & (y > 0)
+
+        # all bins (faint)
+        ax.scatter(
+            x,
+            np.log(y),
+            s=40,
+            alpha=0.25,
+            color="tab:blue",
+            label="bin avg (all)"
+        )
+
+        # valid bins (bold)
+        ax.scatter(
+            x[valid],
+            np.log(y[valid]),
+            s=80,
+            alpha=0.9,
+            color="tab:blue",
+            edgecolor="black",
+            label="bin avg (valid)"
+        )
+
+        # -------------------------
+        # 3) Exp fit (valid bins only used in estimation)
+        # -------------------------
+        if np.isfinite(r["A"]) and np.isfinite(r["eta"]):
+            x_fit = np.linspace(x.min()/100, x.max()/100, 200)
+            y_fit = np.log(r["A"]) - r["eta"] * x_fit
+            ax.plot(
+                x_fit * 100,
+                y_fit,
+                lw=2,
+                color="red",
+                label=fr"fit: $\log\Lambda=\log A-\eta\delta$"
+            )
+
+        # -------------------------
+        # Labels
+        # -------------------------
+        title = f"{r['regime_name']} – {r['side'].capitalize()}"
+        ds = f"δ∈[{r['delta_support_low']*100:.2f}¢,{r['delta_support_high']*100:.2f}¢]"
+        diag = f"corr={r['shape_corr']:.2f}, viol={r['shape_monotone_viol']}"
+
+        ax.set_title(f"{title}\n{ds}, {diag}")
+        ax.set_xlabel("Half-spread δ (cents)")
+        ax.set_ylabel("log(Fill rate)")
+        ax.grid(True, alpha=0.3)
+
+    handles, labels = axes[0,0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=4)
+    plt.tight_layout(rect=[0, 0.08, 1, 1])
+
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+        print(f"Saved appendix figure: {save_path}")
+    plt.close()
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    print("=" * 70)
+    print("Step 3 (V5): Final Intensity Estimation (SIDE-only η + Regime-specific A)")
+    print("=" * 70)
+
+    # ------------------------------------------------------------
+    # 1) Load
+    # ------------------------------------------------------------
+    print("\n" + "-" * 60)
+    print("1. Loading Data")
+    print("-" * 60)
+
+    quotes = pd.read_csv(CSV_DIR / "quotes_cleaned.csv", parse_dates=["DateTime"])
+    trades = pd.read_csv(CSV_DIR / "trades_classified.csv", parse_dates=["DateTime"])
+    regimes = pd.read_csv(CSV_DIR / "regime_results.csv", parse_dates=["DateTime"])
+
+    print(f"  Quotes: {len(quotes):,}")
+    print(f"  Trades: {len(trades):,}")
+    print(f"  Regime obs: {len(regimes):,}")
+
+    # ------------------------------------------------------------
+    # 2) Add regime labels (5min) + Quote duration + HalfSpread
+    # ------------------------------------------------------------
+    print("\n" + "-" * 60)
+    print("2. Preparing Data (Regime merge + Quote durations)")
+    print("-" * 60)
+
+    quotes["DateTime_5min"] = quotes["DateTime"].dt.floor("5min")
+    trades["DateTime_5min"] = trades["DateTime"].dt.floor("5min")
+    regimes["DateTime_5min"] = regimes["DateTime"]
+
+    regmap = regimes[["DateTime_5min", "Regime"]].drop_duplicates()
+
+    quotes = quotes.merge(regmap, on="DateTime_5min", how="left")
+    trades = trades.merge(regmap, on="DateTime_5min", how="left")
+
+    quotes["Regime"] = quotes["Regime"].ffill().bfill()
+    trades["Regime"] = trades["Regime"].ffill().bfill()
+
+    quotes = quotes.dropna(subset=["Regime"]).copy()
+    trades = trades.dropna(subset=["Regime"]).copy()
+    quotes["Regime"] = quotes["Regime"].astype(int)
+    trades["Regime"] = trades["Regime"].astype(int)
+
+    # Quote durations per day
+    quotes = quotes.sort_values(["Date", "DateTime"]).reset_index(drop=True)
+    quotes["Duration"] = quotes.groupby("Date")["DateTime"].diff().shift(-1)
+    quotes["Duration_sec"] = quotes["Duration"].dt.total_seconds()
+
+    quotes = quotes[(quotes["Duration_sec"] > 0) & (quotes["Duration_sec"] < MAX_GAP_SEC)].copy()
+    quotes["HalfSpread"] = quotes["Spread"] / 2.0
+
+    print(f"  Valid quotes: {len(quotes):,}")
+    print(f"  Total exposure: {quotes['Duration_sec'].sum()/3600:.2f} hours")
+    print(f"  Mean duration: {quotes['Duration_sec'].mean()*1000:.2f} ms | Median: {quotes['Duration_sec'].median()*1000:.2f} ms")
+
+    # ------------------------------------------------------------
+    # 3) Match trades to active quotes + strict quote-hit classification
+    # ------------------------------------------------------------
+    print("\n" + "-" * 60)
+    print("3. Matching Trades to Active Quotes (Strict quote-hit)")
+    print("-" * 60)
+
+    trades = trades.sort_values("DateTime").reset_index(drop=True)
+
+    quotes_for_merge = quotes[["DateTime", "Bid", "Ask", "HalfSpread"]].rename(
+        columns={"Bid": "Quote_Bid", "Ask": "Quote_Ask", "HalfSpread": "Quote_Delta"}
+    )
+    trades = pd.merge_asof(trades, quotes_for_merge, on="DateTime", direction="backward")
+
+    trades["AtAsk"] = trades["Price"] >= (trades["Quote_Ask"] - PRICE_TOL)
+    trades["AtBid"] = trades["Price"] <= (trades["Quote_Bid"] + PRICE_TOL)
+    trades["ExecSide"] = np.where(trades["AtAsk"], "buy", np.where(trades["AtBid"], "sell", "unknown"))
+
+    n_buy = int((trades["ExecSide"] == "buy").sum())
+    n_sell = int((trades["ExecSide"] == "sell").sum())
+    n_unk = int((trades["ExecSide"] == "unknown").sum())
+
+    print(f"  At Ask (buy): {n_buy:,}")
+    print(f"  At Bid (sell): {n_sell:,}")
+    print(f"  Unknown (excluded): {n_unk:,}")
+
+    trades_strict = trades[trades["ExecSide"] != "unknown"].copy()
+    print(f"  Trades for estimation: {len(trades_strict):,}")
+
+    # ------------------------------------------------------------
+    # 4) Estimate η by side (pooled across regimes)
+    # ------------------------------------------------------------
+    print("\n" + "-" * 60)
+    print("4. Estimating SIDE-only η (pooled across regimes)")
+    print("-" * 60)
+
+    pooled_eta = {}
+    pooled_details = {}
+
+    for side in ["buy", "sell"]:
+        res = estimate_eta_pooled_by_side(quotes, trades_strict, side)
+        pooled_eta[side] = res["eta"]
+        pooled_details[side] = res
+
+        print(f"\n  {side}:")
+        print(f"    δ support ({DELTA_Q_LOW:.0%}-{DELTA_Q_HIGH:.0%}, quotes-based): "
+              f"[{res['delta_support_low']*100:.3f}, {res['delta_support_high']*100:.3f}] cents")
+        print(f"    bins_used={res['bins_used']}, valid_bins={res['n_valid_bins']}")
+        if np.isfinite(res["eta"]):
+            print(f"    η^{side} = {res['eta']:.2f}  | pooled A = {res['A_pooled']:.4f}  | R²(log)={res['r2_log']:.4f}")
+        else:
+            print("    η estimation FAILED (insufficient slope identification).")
+
+    if not (np.isfinite(pooled_eta["buy"]) and np.isfinite(pooled_eta["sell"])):
+        print("\nERROR: Could not estimate η for both sides. Exiting.")
+        return
+
+    # ------------------------------------------------------------
+    # 5) Estimate regime-specific A given η^side
+    # ------------------------------------------------------------
+    print("\n" + "-" * 60)
+    print("5. Estimating Regime-specific A (given η^side)")
+    print("-" * 60)
+
+    A_results = []
+    for regime in [0, 1]:
+        for side in ["buy", "sell"]:
+            eta = pooled_eta[side]
+            ares = estimate_A_regime_side_given_eta(quotes, trades_strict, regime, side, eta)
+            A_results.append(ares)
+
+            print(f"\n  {ares['regime_name']} {side}:")
+            print(f"    Exposure: {ares['total_exposure_sec']/3600:.2f} hours | Fills: {ares['total_fills']:,}")
+            print(f"    Mean δ (fills): {ares['mean_delta']*100:.3f} cents | Overall rate: {ares['overall_rate']:.4f}/s")
+            print(f"    A_{ares['regime_name']}^{side} = {ares['A']:.4f} (at δ=0)")
+
+    # ------------------------------------------------------------
+    # 6) Regime-wise shape audit (bin-based)
+    # ------------------------------------------------------------
+    print("\n" + "-" * 60)
+    print("6. Regime-wise Shape Check (bin-based, exp plausibility)")
+    print("-" * 60)
+
+    final_results = []
+    binned_rows = []
+
+    # Turn A_results into lookup
+    A_lookup = {(r["regime"], r["side"]): r for r in A_results}
+
+    for regime in [0, 1]:
+        for side in ["buy", "sell"]:
+            eta = pooled_eta[side]
+            ainfo = A_lookup[(regime, side)]
+
+            audit = regime_shape_audit(quotes, trades_strict, regime, side, eta)
+
+            # Merge into final structure for plots/saving
+            final = {
+                "regime": regime,
+                "regime_name": "Low" if regime == 0 else "High",
+                "side": side,
+                "A": ainfo["A"],
+                "eta": eta,
+                "overall_rate": ainfo["overall_rate"],
+                "mean_delta": ainfo["mean_delta"],
+                "delta_support_low": audit["delta_support_low"],
+                "delta_support_high": audit["delta_support_high"],
+                "bins_used": audit["bins_used"],
+                "shape_nbins": audit["shape_nbins"],
+                "shape_corr": audit["shape_corr"],
+                "shape_monotone_viol": audit["shape_monotone_viol"],
+                "bin_centers": audit["bin_centers"],
+                "bin_exposure": audit["bin_exposure"],
+                "bin_fills": audit["bin_fills"],
+                "bin_rates": audit["bin_rates"],
+            }
+            final_results.append(final)
+
+            print(f"\n  {final['regime_name']} {side}:")
+            print(f"    δ support ({DELTA_Q_LOW:.0%}-{DELTA_Q_HIGH:.0%}, quotes-based): "
+                  f"[{final['delta_support_low']*100:.3f}, {final['delta_support_high']*100:.3f}] cents")
+            print(f"    Shape check: corr(log rate, δ)={final['shape_corr']}, monotone violations={final['shape_monotone_viol']} "
+                  f"(nbins used={final['bins_used']}, nbins valid={final['shape_nbins']})")
+
+            # bin audit table
+            for c, exp, fl, rt in zip(final["bin_centers"], final["bin_exposure"], final["bin_fills"], final["bin_rates"]):
+                is_valid = (exp >= MIN_EXPOSURE_SEC_SHAPE) and (fl >= MIN_FILLS_SHAPE) and (rt > 0)
+                binned_rows.append({
+                    "Regime": final["regime_name"],
+                    "Side": side,
+                    "delta": float(c),
+                    "delta_cents": float(c * 100),
+                    "exposure_sec": float(exp),
+                    "fills": int(fl),
+                    "rate_per_sec": float(rt),
+                    "is_valid": bool(is_valid),
+                })
+
+    # ------------------------------------------------------------
+    # 7) Save tables
+    # ------------------------------------------------------------
+    print("\n" + "-" * 60)
+    print("7. Saving Parameters")
+    print("-" * 60)
+
+    # Main parameter table
+    rows = []
+    for r in final_results:
+        rows.append({
+            "Regime": r["regime"],
+            "Regime_Name": r["regime_name"],
+            "Side": r["side"],
+            "A": r["A"],
+            "eta": r["eta"],
+            "overall_rate_per_sec": r["overall_rate"],
+            "mean_delta_fills": r["mean_delta"],
+            "delta_support_low": r["delta_support_low"],
+            "delta_support_high": r["delta_support_high"],
+            "shape_corr": r["shape_corr"],
+            "shape_monotone_viol": r["shape_monotone_viol"],
+            "bins_used_shape": r["bins_used"],
+            "shape_nbins_valid": r["shape_nbins"],
+            # add pooled η fit quality
+            "eta_pooled_r2_log": pooled_details[r["side"]]["r2_log"],
+            "eta_pooled_bins_used": pooled_details[r["side"]]["bins_used"],
+            "eta_pooled_valid_bins": pooled_details[r["side"]]["n_valid_bins"],
+        })
+
+    params_df = pd.DataFrame(rows)
+    out_params = PARAMS_DIR / "intensity_parameters_side_eta.csv"
+    params_df.to_csv(out_params, index=False)
+    print(f"  Saved: {out_params}")
+
+    # Minimal HJB input
+    hjb_df = params_df[["Regime", "Regime_Name", "Side", "A", "eta"]].copy()
+    out_hjb = PARAMS_DIR / "intensity_for_hjb_side_eta.csv"
+    hjb_df.to_csv(out_hjb, index=False)
+    print(f"  Saved: {out_hjb}")
+
+    # Bin audit
+    binned_df = pd.DataFrame(binned_rows)
+    out_bins = PARAMS_DIR / "intensity_binned_rates_side_eta.csv"
+    binned_df.to_csv(out_bins, index=False)
+    print(f"  Saved: {out_bins}")
+
+    # ------------------------------------------------------------
+    # 8) Plots
+    # ------------------------------------------------------------
+    print("\n" + "-" * 60)
+    print("8. Creating Plots")
+    print("-" * 60)
+
+    out_plot = PLOTS_DIR / "intensity_side_eta_fit.png"
+    out_plot_log = PLOTS_DIR / "intensity_side_eta_fit_log.png"
+
+    plot_panels(final_results, pooled_eta, out_plot, log_scale=False)
+    plot_panels(final_results, pooled_eta, out_plot_log, log_scale=True)
+
+    print(f"  Saved: {out_plot}")
+    print(f"  Saved: {out_plot_log}")
+
+    appendix_path = PLOTS_DIR / "appendix_hexbin_bins_overlay.png"
+    plot_appendix_hexbin_with_bins(
+        quotes,
+        trades_strict,
+        final_results,
+        save_path=appendix_path
+    )
+
+
+    
+
+    # ------------------------------------------------------------
+    # 9) Summary
+    # ------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("FINAL INTENSITY PARAMETERS (SIDE-only η + Regime-specific A)")
+    print("=" * 70)
+
+    print("\n  Pooled η by side:")
+    for side in ["buy", "sell"]:
+        print(f"    η^{side}: {pooled_eta[side]:.2f}  (R²_log={pooled_details[side]['r2_log']:.3f}, valid_bins={pooled_details[side]['n_valid_bins']})")
+
+    view = params_df[["Regime_Name", "Side", "A", "eta", "shape_corr", "shape_monotone_viol", "overall_rate_per_sec"]].copy()
+    view["A"] = view["A"].map(lambda v: f"{v:.4f}" if np.isfinite(v) else "NA")
+    view["eta"] = view["eta"].map(lambda v: f"{v:.2f}" if np.isfinite(v) else "NA")
+    view["shape_corr"] = view["shape_corr"].map(lambda v: f"{v:.2f}" if np.isfinite(v) else "NA")
+    view["overall_rate_per_sec"] = view["overall_rate_per_sec"].map(lambda v: f"{v:.4f}")
+    print("\n" + view.to_string(index=False))
+
+    print("\n" + "=" * 70)
+    print("✅ Step 3 (V5) Complete! Ready for Step 4 (CI HJB Solver)")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
